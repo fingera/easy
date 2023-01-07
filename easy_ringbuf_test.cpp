@@ -2,8 +2,50 @@
 #include <stdio.h>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #include "easy_ringbuf.hpp"
+
+class EasyRingBufYield {
+public:
+  EasyRingBufYield(size_t maxSize) {}
+  inline void Wait(unsigned readed, unsigned wrote, bool forRead) { std::this_thread::yield(); }
+  inline void Wakeup(unsigned readed, unsigned wrote) {}
+};
+
+class EasyRingBufWait {
+protected:
+  std::mutex _mutex;
+  std::condition_variable _cv;
+  bool _readIsWaiting = false;
+  bool _writeIsWaiting = false;
+  unsigned _size = 0;
+  unsigned _max;
+public:
+  EasyRingBufWait(size_t maxSize) : _max(maxSize) {}
+  inline void Wait(unsigned readed, unsigned wrote, bool forRead) {
+    Wakeup(readed, wrote);
+    std::unique_lock<std::mutex> lock(_mutex);
+    if (forRead) {
+      _cv.wait(lock, [this] () {
+        _readIsWaiting = _size == 0;
+        return !_readIsWaiting;
+      });
+    } else {
+      _cv.wait(lock, [this] () {
+        _writeIsWaiting = _size == _max;
+        return !_writeIsWaiting;
+      });
+    }
+  }
+  inline void Wakeup(unsigned readed, unsigned wrote) {
+    std::lock_guard<std::mutex> guard(_mutex);
+    _size += wrote; _size -= readed;
+    if ((_size > 0 && _readIsWaiting) || (_size < _max && _writeIsWaiting))
+      _cv.notify_all();
+  }
+};
 
 uint32_t crc32(const char* s, int len);
 
@@ -20,7 +62,8 @@ void randBuffer(std::vector<char> &buf) {
 #define DPRINT(...)
 #endif
 
-void verifyPong(CEasyRingBuf *ping, CEasyRingBuf *pong) {
+template<typename T>
+void verifyPong(T *ping, T *pong) {
   uint32_t size, checksum;
   std::vector<char> buffer;
   size_t count = 0;
@@ -49,7 +92,8 @@ void verifyPong(CEasyRingBuf *ping, CEasyRingBuf *pong) {
   printf("pong stopped %zd\n", count);
 }
 
-void verifyPing(CEasyRingBuf *ping, CEasyRingBuf *pong, size_t loop, size_t limit) {
+template<typename T>
+void verifyPing(T *ping, T *pong, size_t loop, size_t limit) {
   uint32_t size, checksum;
   std::vector<char> buffer;
   size_t count = 0;
@@ -80,20 +124,40 @@ void verifyPing(CEasyRingBuf *ping, CEasyRingBuf *pong, size_t loop, size_t limi
   ping->WriteLoop(size);
 }
 
+class Timestamp {
+  const char *_name;
+  std::chrono::time_point<std::chrono::high_resolution_clock> _start;
+  std::chrono::time_point<std::chrono::high_resolution_clock> _stop;
+public:
+  Timestamp(const char *name) : _name(name) {}
+  void Start() {
+    _start = std::chrono::high_resolution_clock::now();
+  }
+  void Stop() {
+    _stop = std::chrono::high_resolution_clock::now();
+  }
+  ~Timestamp() {
+    auto diff = _stop - _start;
+    long count = (long)std::chrono::duration_cast<std::chrono::milliseconds>(diff).count();
+    printf("%s time: %ld s, %ld ms\n", _name, count / 1000, count % 1000);
+  }
+};
+
+template<typename T>
 void testPingPong(size_t pairs, size_t loopCount, size_t pingBufSize, size_t pongBufSize, size_t dataLimitSize) {
 
-  std::vector<CEasyRingBuf *> pingRings, pongRings;
+  std::vector<T *> pingRings, pongRings;
   std::vector<char *> pingBufs, pongBufs;
   std::vector<std::thread> pingThreads, pongThreads;
 
   for (size_t i = 0; i < pairs; i++) {
     pingBufs.push_back(new char[pingBufSize]);
-    pingRings.push_back(new CEasyRingBuf(pingBufs.back(), pingBufSize));
+    pingRings.push_back(new T(pingBufs.back(), pingBufSize));
     pongBufs.push_back(new char[pongBufSize]);
-    pongRings.push_back(new CEasyRingBuf(pongBufs.back(), pongBufSize));
+    pongRings.push_back(new T(pongBufs.back(), pongBufSize));
 
-    pingThreads.emplace_back(verifyPing, pingRings.back(), pongRings.back(), loopCount, dataLimitSize);
-    pongThreads.emplace_back(verifyPong, pingRings.back(), pongRings.back());
+    pingThreads.emplace_back(verifyPing<T>, pingRings.back(), pongRings.back(), loopCount, dataLimitSize);
+    pongThreads.emplace_back(verifyPong<T>, pingRings.back(), pongRings.back());
   }
 
   for (size_t i = 0; i < pingThreads.size(); i++) {
@@ -110,12 +174,19 @@ void testPingPong(size_t pairs, size_t loopCount, size_t pingBufSize, size_t pon
 }
 
 int main(void) {
-  size_t threadPairs = 2;
-  size_t loopCount = 10000;
+  size_t threadPairs = 16;
+  size_t loopCount = 1000;
   size_t pingBufSize = 1024 * 8;
   size_t pongBufSize = 1024 * 4;
   size_t dataLimitSize = 1024 * 32;
-  testPingPong(threadPairs, loopCount, pingBufSize, pongBufSize, dataLimitSize);
+  Timestamp t1("yield"), t2("wait"), t3("null");
+  t1.Start();
+  testPingPong< CEasyRingBuf<EasyRingBufYield> >(threadPairs, loopCount, pingBufSize, pongBufSize, dataLimitSize);
+  t1.Stop(); t2.Start();
+  testPingPong< CEasyRingBuf<EasyRingBufWait> >(threadPairs, loopCount, pingBufSize, pongBufSize, dataLimitSize);
+  t2.Stop(); t3.Start();
+  testPingPong< CEasyRingBuf<EasyRingBufNull> >(threadPairs, loopCount, pingBufSize, pongBufSize, dataLimitSize);
+  t3.Stop();
 
   return 0;
 }
